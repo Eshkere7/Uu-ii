@@ -1,0 +1,317 @@
+name: Build MouseTouch APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Create project files
+        run: |
+          mkdir -p MouseTouch/app
+          cat > MouseTouch/app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.mousetouch"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.mousetouch"
+                  minSdk = 34          // onMotionEvent for accessibility services appeared in Android 14
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p MouseTouch/app/src/main
+          cat > MouseTouch/app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".MouseTouchService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p MouseTouch/app/src/main/java/com/example/mousetouch
+          cat > MouseTouch/app/src/main/java/com/example/mousetouch/MainActivity.kt <<'EOF_FILE'
+          package com.example.mousetouch
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (24 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  root.addView(TextView(this).apply {
+                      textSize = 16f
+                      text = "1. Нажмите кнопку ниже.\n" +
+                          "2. Выберите «Mouse Touch» в списке служб и включите её.\n" +
+                          "3. Вернитесь в игру: левая кнопка мыши теперь работает как палец."
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Открыть настройки специальных возможностей"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                  })
+                  setContentView(root)
+              }
+          }
+          EOF_FILE
+          mkdir -p MouseTouch/app/src/main/java/com/example/mousetouch
+          cat > MouseTouch/app/src/main/java/com/example/mousetouch/MouseTouchService.kt <<'EOF_FILE'
+          package com.example.mousetouch
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.accessibilityservice.GestureDescription.StrokeDescription
+          import android.graphics.Path
+          import android.view.InputDevice
+          import android.view.MotionEvent
+          import android.view.accessibility.AccessibilityEvent
+
+          /**
+           * Превращает зажатую левую кнопку мыши в один непрерывный жест-касание.
+           * Жест отправляется короткими кусками (SEGMENT_MS), каждый следующий продолжает
+           * предыдущий (continueStroke), пока кнопка зажата. Так работают тап, удержание
+           * (ходьба на D-pad/джойстике) и перетаскивание.
+           */
+          class MouseTouchService : AccessibilityService() {
+
+              private var pressed = false      // левая кнопка сейчас зажата
+              private var curX = 0f            // последняя позиция курсора
+              private var curY = 0f
+              private var lastX = 0f           // где закончился предыдущий кусок жеста
+              private var lastY = 0f
+              private var stroke: StrokeDescription? = null
+              private var continuing = false   // последний отправленный кусок ждёт продолжения
+              private var inFlight = false     // жест сейчас выполняется системой
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  val info = serviceInfo
+                  info.motionEventSources = InputDevice.SOURCE_MOUSE
+                  serviceInfo = info
+              }
+
+              override fun onMotionEvent(event: MotionEvent) {
+                  curX = event.x
+                  curY = event.y
+                  when (event.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          if (event.buttonState and MotionEvent.BUTTON_PRIMARY != 0 && !pressed) {
+                              pressed = true
+                              lastX = curX
+                              lastY = curY
+                              if (!inFlight) sendSegment(first = true)
+                          }
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> pressed = false
+                      else -> {
+                          // ACTION_MOVE / ACTION_HOVER_MOVE: позиция уже обновлена выше
+                          if (pressed && event.buttonState and MotionEvent.BUTTON_PRIMARY == 0) pressed = false
+                      }
+                  }
+              }
+
+              private fun sendSegment(first: Boolean) {
+                  val path = Path().apply {
+                      moveTo(lastX, lastY)
+                      if (curX != lastX || curY != lastY) lineTo(curX, curY)
+                  }
+                  val willContinue = pressed
+                  val prev = stroke
+                  val next = if (first || prev == null) {
+                      StrokeDescription(path, 0, SEGMENT_MS, willContinue)
+                  } else {
+                      prev.continueStroke(path, 0, SEGMENT_MS, willContinue)
+                  }
+                  stroke = next
+                  lastX = curX
+                  lastY = curY
+                  continuing = willContinue
+                  inFlight = true
+
+                  val ok = dispatchGesture(
+                      GestureDescription.Builder().addStroke(next).build(),
+                      object : GestureResultCallback() {
+                          override fun onCompleted(gestureDescription: GestureDescription?) {
+                              inFlight = false
+                              if (continuing) sendSegment(first = false)
+                              else stroke = null
+                          }
+
+                          override fun onCancelled(gestureDescription: GestureDescription?) {
+                              inFlight = false
+                              continuing = false
+                              stroke = null
+                              pressed = false
+                          }
+                      },
+                      null
+                  )
+                  if (!ok) {
+                      inFlight = false
+                      continuing = false
+                      stroke = null
+                  }
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {
+                  pressed = false
+                  continuing = false
+                  stroke = null
+                  inFlight = false
+              }
+
+              private companion object {
+                  const val SEGMENT_MS = 80L
+              }
+          }
+          EOF_FILE
+          mkdir -p MouseTouch/app/src/main/res/values
+          cat > MouseTouch/app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Mouse Touch</string>
+              <string name="service_description">Превращает нажатия левой кнопки мыши в касания пальцем, чтобы мышь могла нажимать экранные кнопки (удержание и перетаскивание тоже работают).</string>
+          </resources>
+          EOF_FILE
+          mkdir -p MouseTouch/app/src/main/res/xml
+          cat > MouseTouch/app/src/main/res/xml/accessibility_service_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/service_description"
+              android:notificationTimeout="100" />
+          EOF_FILE
+          mkdir -p MouseTouch
+          cat > MouseTouch/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p MouseTouch
+          cat > MouseTouch/gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          mkdir -p MouseTouch
+          cat > MouseTouch/settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MouseTouch"
+          include(":app")
+          EOF_FILE
+
+      - name: Build debug APK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          cd MouseTouch
+          gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MouseTouch-apk
+          path: MouseTouch/app/build/outputs/apk/debug/app-debug.apk
+          ons: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+
+      # Runs a single command using the runners shell
+      - name: Run a one-line script
+        run: echo Hello, world!
+
+      # Runs a set of commands using the runners shell
+      - name: Run a multi-line script
+        run: |
+          echo Add other actions to build,
+          echo test, and deploy your project.
